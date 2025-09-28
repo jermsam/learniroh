@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         Ok(endpoint) => {
             // let memory = MemStore::new();
             let home = dirs_next::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
-            let tmp = home.join(".lean").join(".data");
+            let tmp = home.join(".lean".to_string()).join(".data".to_string());
             let temp_store = FsStore::load(tmp).await?;
             let blobs_protocol = BlobsProtocol::new(&temp_store, endpoint.clone(), None);
 
@@ -50,7 +50,6 @@ async fn main() -> Result<()> {
         }
         Err(e) => {
             println!("Endpoint error: {:?}", e);
-            // Ok(())
         }
     }
 
