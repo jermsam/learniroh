@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
                     destination_path,
                 } => connect(&blobs_protocol, &endpoint, &token, destination_path.as_str()).await?,
             }
+            drop(temp_store);
         }
         Err(e) => {
             println!("Endpoint error: {:?}", e);
