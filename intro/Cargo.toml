@@ -13,6 +13,8 @@ component_type = "server"
 [dependencies]
 anyhow = "1.0.100"
 clap = {version =  "4.5.48", default-features = true, features = ["derive"] }
+colored = "3.0.0"
+dirs-next = "2.0.0"
 iroh = "0.92.0"
 iroh-blobs = "0.94.0"
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros"] }

@@ -1,18 +1,24 @@
+use anyhow::{anyhow, Result};
+use clap::{Parser, Subcommand};
+use colored::Colorize;
+use iroh::protocol::Router;
+use iroh::*;
+use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
+use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::ticket::BlobTicket;
+use iroh_blobs::BlobsProtocol;
 use std::path::{absolute, PathBuf};
 use std::str::FromStr;
-use anyhow::Result;
-use iroh::*;
-use iroh_blobs::{ticket, BlobsProtocol};
-use iroh_blobs::store::mem::MemStore;
-use clap::{Parser, Subcommand};
-use iroh::protocol::Router;
-use iroh_blobs::api::tags::TagInfo;
-use iroh_blobs::ticket::BlobTicket;
 
 #[derive(Subcommand)]
 enum Cmd {
-    Listen { pathname: String },
-    Connect { token: String , destination_path: String },
+    Listen {
+        pathname: String,
+    },
+    Connect {
+        token: String,
+        destination_path: String,
+    },
 }
 
 #[derive(Parser)]
@@ -23,34 +29,25 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    
-    match  Endpoint::builder()
-        .discovery_n0()
-        .bind()
-        .await{
+    match Endpoint::builder().discovery_n0().bind().await {
         Ok(endpoint) => {
-            let memory = MemStore::new();
-            let blobs_protocol = BlobsProtocol::new(&memory, endpoint.clone(), None);
+            // let memory = MemStore::new();
+            let home = dirs_next::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+            let tmp = home.join(".lean").join(".data");
+            let temp_store = FsStore::load(tmp).await?;
+            let blobs_protocol = BlobsProtocol::new(&temp_store, endpoint.clone(), None);
 
             match Cli::parse().cmd {
-                Cmd::Listen { pathname }=> {
-                    let tag = listen(&blobs_protocol, pathname.as_str()).await?;
-                    let node_addr = endpoint.node_id().into();
-                    let ticket = BlobTicket::new(node_addr, tag.hash, tag.format);
-                    println!("Connect using ticket: {}", ticket);
-                },
-                Cmd::Connect { token, destination_path } => connect(&blobs_protocol, &endpoint, &token, &destination_path).await?,
+                Cmd::Listen { pathname } => {
+                    listen(&blobs_protocol, &endpoint, pathname.as_str()).await?;
+                    route(endpoint, blobs_protocol).await?;
+                }
+                Cmd::Connect {
+                    token,
+                    destination_path,
+                } => connect(&blobs_protocol, &endpoint, &token, &destination_path).await?,
             }
-
-            let router =  Router::builder(endpoint)
-                .accept(iroh_blobs::ALPN, blobs_protocol)
-                .spawn();
-            tokio::signal::ctrl_c().await?;
-            // Gracefully shut down the node
-            println!("Shutting down.");
-            router.shutdown().await?;
-
-        },
+        }
         Err(e) => {
             println!("Endpoint error: {:?}", e);
             // Ok(())
@@ -60,21 +57,67 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn listen(protocol: &BlobsProtocol, pathname: &str) -> Result<TagInfo> {
+async fn listen(protocol: &BlobsProtocol, endpoint: &Endpoint, pathname: &str) -> Result<()> {
     let path = PathBuf::from(pathname);
     let abs_path = absolute(path)?;
     let tag = protocol.add_path(abs_path).await?;
-    Ok(tag)
+    let node_addr = endpoint.node_id().into();
+    let ticket = BlobTicket::new(node_addr, tag.hash, tag.format);
+    println!("TICKET: {}", format!("{}", ticket).blue());
+    Ok(())
 }
 
-async fn connect( protocol: &BlobsProtocol, endpoint: &Endpoint, token: &str, destination_path: &str) -> Result<()> {
+async fn route(endpoint: Endpoint, protocol: BlobsProtocol) -> Result<()> {
+    let router = Router::builder(endpoint)
+        .accept(iroh_blobs::ALPN, protocol)
+        .spawn();
+    tokio::signal::ctrl_c().await?;
+    // Gracefully shut down the node
+    println!("Shutting down.");
+    router.shutdown().await?;
+    Ok(())
+}
+
+async fn connect(
+    protocol: &BlobsProtocol,
+    endpoint: &Endpoint,
+    token: &str,
+    destination_path: &str,
+) -> Result<()> {
     let ticket = BlobTicket::from_str(token)?;
-    let downloader = protocol.downloader(endpoint);
-    downloader.download(ticket.hash(),  Some(ticket.node_addr().node_id)).await?;
+    let hash = ticket.hash();
+    let provider = Some(ticket.node_addr().node_id);
+
+    let store = protocol.store();
+    let downloader = store.downloader(endpoint);
+
+    println!("Starting download...");
+    downloader.download(hash, provider).await?;
     println!("Finished download.");
     let path = PathBuf::from(destination_path);
     let abs_path = absolute(path)?;
-    protocol.export(ticket.hash(), abs_path).await?;
-    println!("Finished copying.");
+
+    // If the destination is a directory, create a filename based on the hash
+    let export_path = if abs_path.is_dir() {
+        abs_path.join(format!("downloaded_{}", hash))
+    } else {
+        abs_path
+    };
+
+    println!("Exporting to: {}", export_path.display());
+
+    // Export using TryReference to avoid an extra copy when possible
+    let options = ExportOptions {
+        hash: ticket.hash(),
+        mode: ExportMode::TryReference,
+        target: export_path.clone(),
+    };
+
+    protocol.export_with_opts(options).await?;
+
+    println!("Export complete: {}", export_path.display());
+    // Clean shutdown
+    println!("Shutting down receiver.");
+    endpoint.close().await;
     Ok(())
 }
