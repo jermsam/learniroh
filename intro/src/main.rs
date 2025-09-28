@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
                 Cmd::Connect {
                     token,
                     destination_path,
-                } => connect(&blobs_protocol, &endpoint, &token, &destination_path).await?,
+                } => connect(&blobs_protocol, &endpoint, &token, destination_path.as_str()).await?,
             }
         }
         Err(e) => {
