@@ -1,0 +1,18 @@
+[package]
+name = "intro"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata]
+
+[package.metadata.ferrisup]
+component_type = "server"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.100"
+clap = {version =  "4.5.48", default-features = true, features = ["derive"] }
+iroh = "0.92.0"
+iroh-blobs = "0.94.0"
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros"] }
