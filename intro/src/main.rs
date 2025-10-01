@@ -35,11 +35,13 @@ async fn main() -> Result<()> {
             let home = dirs_next::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
             let tmp = home.join(".lean".to_string()).join(".data".to_string());
             let temp_store = FsStore::load(tmp).await?;
+            // This avoids buffering entire blobs in RAM and avoids an extra copy when the filesystem supports hardlinks/reflinks;
             let blobs_protocol = BlobsProtocol::new(&temp_store, endpoint.clone(), None);
 
             match Cli::parse().cmd {
                 Cmd::Listen { pathname } => {
                     listen(&blobs_protocol, &endpoint, pathname.as_str()).await?;
+                    // listen to incoming peers
                     route(endpoint, blobs_protocol).await?;
                 }
                 Cmd::Connect {

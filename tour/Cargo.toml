@@ -11,3 +11,11 @@ component_type = "minimal"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.48", features = ["derive"] }
+colored = "3.0.0"
+iroh = "0.92.0"
+n0-future = "0.2.0"
+n0-snafu = "0.2.2"
+n0-watcher = "0.3.0"
+tokio = { version = "1.0.0", features = ["rt", "rt-multi-thread", "macros"] }

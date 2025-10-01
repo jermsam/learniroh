@@ -1,9 +1,10 @@
 [workspace]
 members = [
-    "intro"
+    "intro",
+    "tour"
 ]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-resolver = "2"
