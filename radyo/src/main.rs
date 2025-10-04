@@ -1,15 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use cpal::traits::{DeviceTrait, HostTrait};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+// use cpal::traits::{DeviceTrait, HostTrait};
+use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, NodeAddr};
 use iroh_base::ticket::NodeTicket;
-use ringbuf::{HeapCons, HeapProd, HeapRb};
-use ringbuf::traits::{Consumer, Producer, Split};
+// use ringbuf::{HeapCons, HeapProd, HeapRb};
+// use ringbuf::traits::{Consumer, Producer, Split};
 use std::future::Future;
 use std::path::Path;
-use tokio::task::JoinHandle;
+// use tokio::task::JoinHandle;
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -148,7 +148,6 @@ fn audio_stream(conn: Connection) {
 }
 
 async fn process_audio_stream(conn: Connection) -> Result<()> {
-    use tokio::io::AsyncReadExt;
     
     // Accept a bi-stream:
     let (mut _send, mut rcv) = conn.accept_bi().await?;
@@ -214,6 +213,11 @@ async fn process_audio_stream(conn: Connection) -> Result<()> {
     Ok(())
 }
 
+// LEGACY AUDIO STREAMING FUNCTIONS - COMMENTED OUT
+// These functions were used for raw audio streaming but are not currently used
+// The current implementation uses MP3 file transfer + rodio for playback
+
+/*
 // create a minimum, lock free ring buffer from an async QUIC stream to a realtime consumer
 
 /// Spawn a task that reads little-endian f32 samples from an AsyncRead and pushes them
@@ -305,3 +309,4 @@ fn playback_stream(mut cons: HeapCons<f32>) -> Result<cpal::Stream> {
     };
     Ok(stream)
 }
+*/
