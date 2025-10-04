@@ -36,7 +36,10 @@ struct RadyoProtocol;
 impl ProtocolHandler for RadyoProtocol {
     fn accept(&self, conn: Connection) -> impl Future<Output = Result<(), AcceptError>> + Send {
         async move {
-            incoming_call_handler(conn).await;
+            // Spawn each call handler concurrently to allow multiple calls
+            tokio::spawn(async move {
+                incoming_call_handler(conn).await;
+            });
             Ok(())
         }
     }
@@ -47,6 +50,10 @@ static CALLER_RINGTONE: std::sync::OnceLock<String> = std::sync::OnceLock::new()
 
 // Global hangup signal - can be triggered by either side
 static HANGUP_SIGNAL: std::sync::OnceLock<tokio::sync::broadcast::Sender<()>> = std::sync::OnceLock::new();
+
+// Global call state - ensure only one call at a time
+static CALL_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 
 // Initialize the hangup signal system
 fn init_hangup_system() -> tokio::sync::broadcast::Receiver<()> {
@@ -69,32 +76,57 @@ async fn hangup() -> Result<()> {
 }
 
 async fn incoming_call_handler(conn: Connection) {
-    println!("📞 New incoming call session started");
-    if let Err(e) = handle_incoming_call(conn).await {
-        eprintln!("❌ Call handling error: {}", e);
+    let call_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() % 10000; // Short ID for this call
+    
+    println!("📞 [CALL-{}] New incoming call session started", call_id);
+    if let Err(e) = handle_incoming_call(conn, call_id).await {
+        eprintln!("❌ [CALL-{}] Call handling error: {}", call_id, e);
     }
-    println!("📞 Call session ended - ready for next call");
+    println!("📞 [CALL-{}] Call session ended - ready for next call", call_id);
 }
 
-async fn handle_incoming_call(conn: Connection) -> Result<()> {
-    println!("📞 Incoming call detected!");
+async fn handle_incoming_call(conn: Connection, call_id: u128) -> Result<()> {
+    println!("📞 [CALL-{}] Incoming call detected!", call_id);
     
     // Accept the bidirectional stream
-    let (send, mut recv) = conn.accept_bi().await?;
+    let (mut send, mut recv) = conn.accept_bi().await?;
     
     // Read the incoming call signal
     let mut buffer = [0u8; 13]; // "INCOMING_CALL" length
     recv.read_exact(&mut buffer).await?;
     
     if &buffer == b"INCOMING_CALL" {
-        println!("📞 Confirmed incoming call - playing ringtone");
+        // Try to acquire call lock - only one call at a time
+        if CALL_IN_PROGRESS.compare_exchange(
+            false, 
+            true, 
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed
+        ).is_err() {
+            // Another call is in progress - send busy signal and close
+            println!("📞 [CALL-{}] Phone is busy - rejecting call", call_id);
+            send.write_all(b"BUSY").await?;
+            send.finish()?; // Close the send stream
+            return Ok(());
+        }
+        
+        println!("📞 [CALL-{}] Confirmed incoming call - phone is now busy", call_id);
         
         // Get the caller's preferred ringtone
         let default_ringtone = "lost_woods".to_string();
         let ringtone_name = CALLER_RINGTONE.get().unwrap_or(&default_ringtone);
         
         // Play the caller's ringtone and listen for hangup signal with acknowledgment
-        play_caller_ringtone_with_hangup_ack(ringtone_name, recv, send).await?;
+        let result = play_caller_ringtone_with_hangup_ack(ringtone_name, recv, send, call_id).await;
+        
+        // Always free the call lock when done
+        CALL_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+        println!("📞 [CALL-{}] Phone is now available for new calls", call_id);
+        
+        result?;
     }
     
     Ok(())
@@ -102,11 +134,12 @@ async fn handle_incoming_call(conn: Connection) -> Result<()> {
 
 
 // Function that listens for HANGUP message and sends acknowledgment
-async fn play_caller_ringtone_with_hangup_ack(ringtone_name: &str, mut recv: iroh::endpoint::RecvStream, mut send: iroh::endpoint::SendStream) -> Result<()> {
-    println!("🎵 Playing caller's ringtone: {}", ringtone_name);
+async fn play_caller_ringtone_with_hangup_ack(ringtone_name: &str, mut recv: iroh::endpoint::RecvStream, mut send: iroh::endpoint::SendStream, call_id: u128) -> Result<()> {
+    println!("🎵 [CALL-{}] Playing caller's ringtone: {}", call_id, ringtone_name);
     
-    // Initialize hangup system for caller side
-    let mut local_hangup_rx = init_hangup_system();
+    // Create per-call hangup channel - NO GLOBAL STATE!
+    let (call_hangup_tx, mut call_hangup_rx) = tokio::sync::broadcast::channel::<()>(1);
+    println!("📡 [CALL-{}] Created independent hangup channel for this call", call_id);
     
     // Load the ringtone file
     let file_path = format!("ringtons/{}.mp3", ringtone_name);
@@ -117,98 +150,165 @@ async fn play_caller_ringtone_with_hangup_ack(ringtone_name: &str, mut recv: iro
         std::fs::read("ringtons/lost_woods.mp3")?
     };
     
-    println!("🔊 Ringtone playing on caller's device...");
-    println!("💡 Press Ctrl+C or call hangup() to stop");
+    println!("🔊 [CALL-{}] Ringtone playing on caller's device...", call_id);
+    println!("💡 [CALL-{}] Press Ctrl+C or call hangup() to stop", call_id);
     
     // Create a shared atomic flag to control audio playback
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_flag_clone = stop_flag.clone();
     
-    // Spawn the audio task with stop control
+    // Create a channel to wait for audio readiness
+    let (audio_ready_tx, audio_ready_rx) = tokio::sync::oneshot::channel();
+    
+    // Spawn dedicated audio thread with readiness notification
     let file_data_clone = file_data.clone();
-    let audio_task = tokio::task::spawn_blocking(move || -> Result<()> {
-        let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
-        let sink = rodio::Sink::try_new(&stream_handle)?;
+    let start_time = std::time::Instant::now();
+    println!("⏰ [CALL-{}] Audio thread spawn starting at {:?}", call_id, start_time);
+    
+    std::thread::spawn(move || {
+        let spawn_delay = start_time.elapsed();
+        println!("🎵 [CALL-{}] Audio thread started (delay: {:?})", call_id, spawn_delay);
         
-        let cursor = std::io::Cursor::new(file_data_clone);
-        let source = rodio::Decoder::new(cursor)?;
-        
-        sink.append(source);
-        sink.set_volume(0.5);
-        
-        // Check for stop signal periodically while playing
-        loop {
-            if sink.empty() {
-                println!("📞 Ringtone finished naturally");
-                break;
-            }
+        let audio_result = (|| -> Result<()> {
+            let audio_start = std::time::Instant::now();
+            println!("🎵 [CALL-{}] Creating audio output stream...", call_id);
+            let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
             
-            // Check if we should stop
-            if stop_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                println!("📞 Ringtone stopped by hangup signal");
-                sink.stop();
-                break;
-            }
+            println!("🎵 [CALL-{}] Creating audio sink...", call_id);
+            let sink = rodio::Sink::try_new(&stream_handle)?;
             
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let cursor = std::io::Cursor::new(file_data_clone);
+            let source = rodio::Decoder::new(cursor)?;
+            
+            sink.append(source);
+            sink.set_volume(0.5);
+            
+            let setup_time = audio_start.elapsed();
+            println!("🎵 [CALL-{}] Audio ready! Setup time: {:?} - RINGTONE SHOULD BE PLAYING NOW", call_id, setup_time);
+            
+            // Signal that audio is ready
+            let _ = audio_ready_tx.send(());
+            
+            // Check for stop signal periodically while playing
+            let mut check_count = 0;
+            loop {
+                if sink.empty() {
+                    println!("📞 [CALL-{}] Ringtone finished naturally (after {} checks)", call_id, check_count);
+                    break;
+                }
+                
+                // Check if we should stop
+                if stop_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    println!("📞 [CALL-{}] Ringtone stopped by hangup signal (after {} checks)", call_id, check_count);
+                    sink.stop();
+                    break;
+                }
+                
+                check_count += 1;
+                if check_count % 10 == 0 {
+                    println!("🔄 [CALL-{}] Audio thread alive - check #{}", call_id, check_count);
+                }
+                
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(())
+        })();
+        
+        if let Err(e) = audio_result {
+            println!("❌ [CALL-{}] Audio thread error: {}", call_id, e);
         }
-        Ok(())
+        println!("🎵 [CALL-{}] Audio thread completed", call_id);
+    });
+    
+    println!("⚡ [CALL-{}] Audio thread spawned, waiting for audio to be ready...", call_id);
+    
+    // Wait for audio to be ready before starting hangup monitoring
+    match tokio::time::timeout(tokio::time::Duration::from_secs(5), audio_ready_rx).await {
+        Ok(Ok(())) => {
+            println!("✅ [CALL-{}] Audio confirmed ready - starting call monitoring", call_id);
+        }
+        Ok(Err(_)) => {
+            println!("⚠️ [CALL-{}] Audio ready channel closed - continuing anyway", call_id);
+        }
+        Err(_) => {
+            println!("⚠️ [CALL-{}] Audio ready timeout - continuing anyway", call_id);
+        }
+    }
+    
+    // Create a dummy audio task for the select! to work with
+    let audio_task = tokio::task::spawn(async {
+        // Just wait indefinitely - the real audio runs in the dedicated thread above
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        Ok::<(), anyhow::Error>(())
     });
     
     // Listen for hangup signal from peer
     let peer_hangup_monitor = async move {
+        println!("👂 [CALL-{}] Starting peer hangup monitor...", call_id);
         let mut hangup_buf = [0u8; 6]; // "HANGUP" length
         match recv.read_exact(&mut hangup_buf).await {
             Ok(_) if &hangup_buf == b"HANGUP" => {
-                println!("📞 Received HANGUP signal from peer!");
+                println!("📞 [CALL-{}] Received HANGUP signal from peer!", call_id);
                 true
             }
             Ok(_) => {
-                println!("📞 Received unexpected data from peer");
+                println!("📞 [CALL-{}] Received unexpected data from peer", call_id);
                 false
             }
-            Err(_) => {
-                println!("📞 Connection lost");
+            Err(e) => {
+                println!("📞 [CALL-{}] Connection lost: {}", call_id, e);
                 false
             }
         }
     };
     
     // Race between audio completion, peer hangup, local hangup, and Ctrl+C
+    println!("🔄 [CALL-{}] Starting select! loop - monitoring for events...", call_id);
     tokio::select! {
         result = audio_task => {
             match result {
-                Ok(Ok(())) => println!("🎵 Ringtone completed normally"),
-                Ok(Err(e)) => println!("❌ Ringtone error: {}", e),
-                Err(e) => println!("❌ Task error: {}", e),
+                Ok(Ok(())) => println!("🎵 [CALL-{}] Audio task completed normally", call_id),
+                Ok(Err(e)) => println!("❌ [CALL-{}] Audio task error: {}", call_id, e),
+                Err(e) => println!("❌ [CALL-{}] Audio task panic: {}", call_id, e),
             }
         }
         hangup_received = peer_hangup_monitor => {
             if hangup_received {
-                println!("🔇 Peer hung up - stopping ringtone!");
+                println!("🔇 [CALL-{}] Peer hung up - stopping ringtone!", call_id);
                 stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
                 
                 // Send acknowledgment to peer
-                println!("📤 Sending hangup acknowledgment to peer...");
+                println!("📤 [CALL-{}] Sending hangup acknowledgment to peer...", call_id);
                 if let Err(e) = send.write_all(b"HANGUP_ACK").await {
-                    println!("⚠️ Failed to send hangup acknowledgment: {}", e);
+                    println!("⚠️ [CALL-{}] Failed to send hangup acknowledgment: {}", call_id, e);
                 } else {
-                    println!("✅ Hangup acknowledgment sent");
+                    println!("✅ [CALL-{}] Hangup acknowledgment sent", call_id);
                 }
                 
-                hangup().await?; // Trigger local hangup too
+                let _ = call_hangup_tx.send(()); // Signal this call to stop
+            } else {
+                println!("🔇 [CALL-{}] Peer hangup monitor returned false", call_id);
             }
         }
-        _ = local_hangup_rx.recv() => {
-            println!("🔇 Local hangup signal received - stopping ringtone!");
+        _ = call_hangup_rx.recv() => {
+            println!("🔇 [CALL-{}] Call-specific hangup signal received - stopping ringtone!", call_id);
             stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
         }
         _ = tokio::signal::ctrl_c() => {
-            println!("🔇 Ctrl+C pressed - hanging up call!");
+            println!("🔇 [CALL-{}] Ctrl+C pressed - hanging up call!", call_id);
             stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
-            hangup().await?;
+            let _ = call_hangup_tx.send(()); // Signal this call to stop
         }
     }
+    
+    // Properly close streams to clean up connection
+    println!("🧹 [CALL-{}] Cleaning up call session...", call_id);
+    drop(send);
+    // recv is already consumed by peer_hangup_monitor
+    
+    // Wait a moment for cleanup to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    println!("✅ [CALL-{}] Call cleanup completed", call_id);
     
     Ok(())
 }
