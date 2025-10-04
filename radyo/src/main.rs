@@ -102,10 +102,10 @@ async fn stream_ringtone(mut send: SendStream, ringtone: String) -> Result<()> {
     // Keep connection alive and wait for Ctrl+C
     println!("Press Ctrl+C to hang up and stop the ringtone");
     tokio::signal::ctrl_c().await?;
-    println!("Hanging up - sending stop signal to caller");
+    println!("Hanging up - closing connection to stop caller's ringtone");
     
-    // Send hangup signal
-    send.write_all(b"HANGUP").await?;
+    // Close the connection cleanly - this will trigger caller's conn.closed().await
+    drop(send);
     
     Ok(())
 }
