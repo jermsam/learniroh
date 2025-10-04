@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 // use cpal::traits::{DeviceTrait, HostTrait};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, NodeAddr};
+use iroh::{Endpoint, NodeAddr, Watcher};
 use iroh_base::ticket::NodeTicket;
 // use ringbuf::{HeapCons, HeapProd, HeapRb};
 // use ringbuf::traits::{Consumer, Producer, Split};
@@ -66,9 +66,11 @@ async fn hangup() -> Result<()> {
 }
 
 async fn incoming_call_handler(conn: Connection) {
+    println!("📞 New incoming call session started");
     if let Err(e) = handle_incoming_call(conn).await {
         eprintln!("❌ Call handling error: {}", e);
     }
+    println!("📞 Call session ended - ready for next call");
 }
 
 async fn handle_incoming_call(conn: Connection) -> Result<()> {
@@ -209,7 +211,7 @@ async fn play_caller_ringtone_with_hangup_ack(ringtone_name: &str, mut recv: iro
 }
 
 async fn caller_mode(ringtone: String) -> Result<()> {
-    println!("📞 Starting caller mode with ringtone: {}", ringtone);
+    println!("📞 Starting persistent phone service with ringtone: {}", ringtone);
     
     // Store the ringtone preference globally
     CALLER_RINGTONE.set(ringtone.clone()).map_err(|_| anyhow::anyhow!("Failed to set ringtone"))?;
@@ -217,20 +219,24 @@ async fn caller_mode(ringtone: String) -> Result<()> {
     let router = Router::builder(endpoint)
         .accept(ALPN, RadyoProtocol)
         .spawn();
-    let node_id = router.endpoint().node_id();
-    let node_addr = NodeAddr::from(node_id);
+    let node_addr = router.endpoint().node_addr().initialized().await;
     let ticket = NodeTicket::new(node_addr);
-    println!("Caller Node ID: {}", ticket);
+    
+    println!("📱 Your Contact Card (Node Ticket): {}", ticket);
+    println!("📞 Phone service is now online - waiting for calls...");
+    println!("💡 Share your contact card with others so they can call you");
+    println!("🔄 This service will handle multiple calls - each call is a separate session");
+    println!("⏹️  Press Ctrl+C to shut down your phone service");
 
     tokio::signal::ctrl_c().await?;
-    println!("Shutting down server...");
+    println!("📞 Shutting down phone service...");
     router.shutdown().await?;
+    println!("✅ Phone service stopped");
     Ok(())
 }
 
 async fn peer_mode(ticket: String) -> Result<()> {
     println!("📞 Starting peer mode - calling: {}", ticket);
-    
     // Initialize hangup system
     let mut hangup_rx = init_hangup_system();
     
