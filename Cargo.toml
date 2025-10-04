@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "intro",
-    "tour"
+    "tour",
+    "radyo"
 ]
 resolver = "2"
 

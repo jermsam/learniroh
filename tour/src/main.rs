@@ -97,14 +97,6 @@ async fn start_accept_side() -> Result<Router> {
     Ok(router)
 }
 
-async fn route(endpoint: Endpoint) -> Result<Router> {
-    let router = Router::builder(endpoint).accept(ALPN, Echo).spawn();
-    tokio::signal::ctrl_c().await?;
-    // Gracefully shut down the node
-    println!("Shutting down.");
-    router.shutdown().await?;
-    Ok(router)
-}
 
 async fn connect_side(node_addr: NodeAddr) -> Result<()> {
     println!("Connecting to: {}", format!("{:?}", node_addr).blue());

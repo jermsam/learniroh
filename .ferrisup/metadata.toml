@@ -5,3 +5,7 @@ created_at = "2025-09-27T13:59:56.451922-06:00"
 ["component.tour"]
 template = "minimal"
 created_at = "2025-09-27T14:00:19.602458-06:00"
+
+["component.radyo"]
+template = "minimal"
+created_at = "2025-10-02T21:45:19.117533-06:00"
