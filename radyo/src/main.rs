@@ -177,25 +177,13 @@ async fn process_audio_stream(conn: Connection) -> Result<()> {
     
     println!("🔊 Ringtone playing on caller's device... (Press Ctrl+C to stop)");
     
-    // Monitor for hangup signal from receiver
+    // Monitor for connection close from receiver
     let sink_clone = sink.clone();
     let connection_monitor = async move {
-        println!("🔍 Monitoring for hangup signal...");
-        let mut hangup_buf = [0u8; 6];
-        match rcv.read_exact(&mut hangup_buf).await {
-            Ok(_) if &hangup_buf == b"HANGUP" => {
-                println!("📞 Received hangup signal - stopping ringtone");
-                sink_clone.stop();
-            }
-            Ok(_) => {
-                println!("📞 Received unexpected data: {:?} - stopping ringtone", hangup_buf);
-                sink_clone.stop();
-            }
-            Err(e) => {
-                println!("📞 Connection error: {} - stopping ringtone", e);
-                sink_clone.stop();
-            }
-        }
+        println!("🔍 Monitoring for connection close...");
+        conn.closed().await;
+        println!("📞 Connection closed - stopping ringtone");
+        sink_clone.stop();
     };
     
     let sink_for_playback = sink.clone();
