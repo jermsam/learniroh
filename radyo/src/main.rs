@@ -74,48 +74,67 @@ async fn stream_ringtone(mut send: SendStream) -> Result<()> {
     
     // Ringtone melody: C5, E5, G5, C6 (523, 659, 784, 1047 Hz)
     let melody_freqs = [523.25, 659.25, 783.99, 1046.50];
-    let note_duration_samples = (sample_rate * 0.4) as usize; // 400ms per note
-    let pause_duration_samples = (sample_rate * 0.1) as usize; // 100ms pause
+    let note_duration_samples = (sample_rate * 0.5) as usize; // 500ms per note (longer)
+    let pause_duration_samples = (sample_rate * 0.15) as usize; // 150ms pause
+    let fade_samples = (sample_rate * 0.02) as usize; // 20ms fade in/out
     let chunk_len: usize = 480; // 10ms chunks
     let mut buf = vec![0u8; chunk_len * 4];
     
-    let mut current_note = 0;
-    let mut samples_in_current_note = 0;
     let mut phase: f32 = 0.0;
-    let mut in_pause = false;
+    let mut chunk_counter = 0;
 
-    println!("Streaming ringtone to peer...");
+    println!("Streaming high-quality ringtone to peer (48kHz)...");
     loop {
+        // Process entire chunk at once for better timing
+        let chunk_start_sample = chunk_counter * chunk_len;
+        
         for i in 0..chunk_len {
-            let s = if in_pause {
-                0.0 // Silence during pause
-            } else {
+            let current_sample = chunk_start_sample + i;
+            let samples_in_current_segment = current_sample % (note_duration_samples + pause_duration_samples);
+            
+            // Determine if we're in a note or pause
+            let is_note_active = samples_in_current_segment < note_duration_samples;
+            
+            // Update current note based on total progress
+            let current_note = (current_sample / (note_duration_samples + pause_duration_samples)) % melody_freqs.len();
+            
+            let s = if is_note_active {
                 let freq = melody_freqs[current_note];
-                let sample = phase.sin() * 0.15; // Softer volume
+                
+                // Calculate envelope for smooth transitions
+                let envelope = if samples_in_current_segment < fade_samples {
+                    // Fade in
+                    samples_in_current_segment as f32 / fade_samples as f32
+                } else if samples_in_current_segment > note_duration_samples - fade_samples {
+                    // Fade out
+                    (note_duration_samples - samples_in_current_segment) as f32 / fade_samples as f32
+                } else {
+                    // Full volume
+                    1.0
+                };
+                
+                // Generate sample with smooth phase continuation
+                let sample = phase.sin() * 0.12 * envelope; // Slightly quieter with envelope
                 phase += two_pi * freq / sample_rate;
                 if phase >= two_pi { phase -= two_pi; }
                 sample
+            } else {
+                // Pause - continue phase evolution to avoid clicks when resuming
+                if current_sample % (note_duration_samples + pause_duration_samples) == note_duration_samples {
+                    // Just entered pause, continue with next note's frequency for smooth transition
+                    let next_note = (current_note + 1) % melody_freqs.len();
+                    let freq = melody_freqs[next_note];
+                    phase += two_pi * freq / sample_rate;
+                    if phase >= two_pi { phase -= two_pi; }
+                }
+                0.0 // Silence during pause
             };
             
             buf[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
-            samples_in_current_note += 1;
-            
-            // Check if we need to move to next note or pause
-            let target_duration = if in_pause { pause_duration_samples } else { note_duration_samples };
-            if samples_in_current_note >= target_duration {
-                samples_in_current_note = 0;
-                if in_pause {
-                    // End of pause, move to next note
-                    current_note = (current_note + 1) % melody_freqs.len();
-                    in_pause = false;
-                    phase = 0.0; // Reset phase for clean note start
-                } else {
-                    // End of note, start pause
-                    in_pause = true;
-                }
-            }
         }
+        
         send.write_all(&buf).await?;
+        chunk_counter += 1;
     }
 }
 
@@ -157,8 +176,8 @@ fn audio_stream(conn: Connection) {
 async fn process_audio_stream(conn: Connection) -> Result<()> {
     // Accept a bi-stream:
     let (mut _send, rcv) = conn.accept_bi().await?;
-    // ~100ms @ 48kHz mono; tune as needed
-    let (cons, handle) = spawn_f32_recv_ring_from_quic(rcv, 4800);
+    // Larger buffer: ~200ms @ 48kHz mono for better network jitter handling
+    let (cons, handle) = spawn_f32_recv_ring_from_quic(rcv, 9600);
     
     // Create and start the audio stream
     let stream = playback_stream(cons)?;
