@@ -148,7 +148,6 @@ fn audio_stream(conn: Connection) {
 }
 
 async fn process_audio_stream(conn: Connection) -> Result<()> {
-    
     // Accept a bi-stream:
     let (mut _send, mut rcv) = conn.accept_bi().await?;
     
@@ -181,14 +180,19 @@ async fn process_audio_stream(conn: Connection) -> Result<()> {
     // Monitor for hangup signal from receiver
     let sink_clone = sink.clone();
     let connection_monitor = async move {
+        println!("🔍 Monitoring for hangup signal...");
         let mut hangup_buf = [0u8; 6];
         match rcv.read_exact(&mut hangup_buf).await {
             Ok(_) if &hangup_buf == b"HANGUP" => {
                 println!("📞 Received hangup signal - stopping ringtone");
                 sink_clone.stop();
             }
-            _ => {
-                println!("📞 Connection lost - stopping ringtone");
+            Ok(_) => {
+                println!("📞 Received unexpected data: {:?} - stopping ringtone", hangup_buf);
+                sink_clone.stop();
+            }
+            Err(e) => {
+                println!("📞 Connection error: {} - stopping ringtone", e);
                 sink_clone.stop();
             }
         }
