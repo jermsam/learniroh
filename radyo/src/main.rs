@@ -1,15 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use cpal::traits::{DeviceTrait, HostTrait};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, NodeAddr};
 use iroh_base::ticket::NodeTicket;
-use ringbuf::{HeapCons, HeapProd, HeapRb};
-use ringbuf::traits::{Consumer, Producer, Split};
 use std::future::Future;
 use std::path::Path;
-use tokio::task::JoinHandle;
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -148,8 +144,7 @@ fn audio_stream(conn: Connection) {
 }
 
 async fn process_audio_stream(conn: Connection) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    
+        
     // Accept a bi-stream:
     let (mut _send, mut rcv) = conn.accept_bi().await?;
     
@@ -212,96 +207,4 @@ async fn process_audio_stream(conn: Connection) -> Result<()> {
     }
     
     Ok(())
-}
-
-// create a minimum, lock free ring buffer from an async QUIC stream to a realtime consumer
-
-/// Spawn a task that reads little-endian f32 samples from an AsyncRead and pushes them
-/// into a lock-free SPSC ring buffer. Returns the consumer end and the JoinHandle for the
-/// producer task. The consumer can be used by a realtime audio callback to pop samples.
-fn spawn_f32_recv_ring_from_quic(
-    recv: RecvStream,
-    capacity_samples: usize,
-) -> (HeapCons<f32>, JoinHandle<anyhow::Result<()>>) {
-    let rb = HeapRb::<f32>::new(capacity_samples);
-    let (mut prod, cons): (HeapProd<f32>, HeapCons<f32>) = rb.split();
-
-    let handle = tokio::spawn(async move {
-        let mut recv = recv;
-        let mut buf = [0u8; 4];
-        loop {
-            match recv.read_exact(&mut buf).await {
-                Ok(_) => {
-                    let s = f32::from_le_bytes(buf);
-                    // Drop the newest on overflow
-                    let _ = prod.try_push(s);
-                }
-                Err(e) => {
-                    // For now, treat any error as EOF to gracefully handle stream end
-                    eprintln!("Read error (treating as EOF): {e}");
-                    break;
-                }
-            }
-        }
-        Ok(())
-    });
-
-    (cons, handle)
-}
-
-fn playback_stream(mut cons: HeapCons<f32>) -> Result<cpal::Stream> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("No default output audio device found"))?;
-    let supported = device.default_output_config()?; // SupportedStreamConfig
-    let channels = supported.channels() as usize;
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => {
-            let cfg: cpal::StreamConfig = supported.clone().into();
-            device.build_output_stream(
-                &cfg,
-                move |data: &mut [f32], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = cons.try_pop().unwrap_or(0.0);
-                        for sample in frame.iter_mut() { *sample = s; }
-                    }
-                },
-                move |err| eprintln!("audio error: {err}"),
-                None,
-            )?
-        }
-        cpal::SampleFormat::I16 => {
-            let cfg: cpal::StreamConfig = supported.clone().into();
-            device.build_output_stream(
-                &cfg,
-                move |data: &mut [i16], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = cons.try_pop().unwrap_or(0.0);
-                        let s = (s * i16::MAX as f32) as i16;
-                        for sample in frame.iter_mut() { *sample = s; }
-                    }
-                },
-                move |err| eprintln!("audio error: {err}"),
-                None,
-            )?
-        }
-        cpal::SampleFormat::U16 => {
-            let cfg: cpal::StreamConfig = supported.clone().into();
-            device.build_output_stream(
-                &cfg,
-                move |data: &mut [u16], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = cons.try_pop().unwrap_or(0.0);
-                        let s = (((s + 1.0) * 0.5).clamp(0.0, 1.0) * u16::MAX as f32) as u16;
-                        for sample in frame.iter_mut() { *sample = s; }
-                    }
-                },
-                move |err| eprintln!("audio error: {err}"),
-                None,
-            )?
-        }
-        _ => unreachable!(),
-    };
-    Ok(stream)
 }
