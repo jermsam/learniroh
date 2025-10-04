@@ -132,15 +132,54 @@ fn load_audio_file(path: &str) -> Result<Vec<f32>> {
     let file = File::open(path)?;
     let source = rodio::Decoder::new(BufReader::new(file))?;
     
-    // Collect all samples and convert to f32
+    // Get source info
+    let channels = source.channels();
+    let sample_rate = source.sample_rate();
+    
+    println!("Loading audio: {} channels, {} Hz", channels, sample_rate);
+    
+    // Convert to f32 samples
     let samples: Vec<f32> = source.convert_samples().collect();
     
     if samples.is_empty() {
         return Err(anyhow::anyhow!("No audio data found in file"));
     }
     
-    println!("Loaded audio file: {} samples", samples.len());
-    Ok(samples)
+    // Convert stereo to mono if needed
+    let mono_samples = if channels == 2 {
+        println!("Converting stereo to mono");
+        samples.chunks(2)
+            .map(|chunk| (chunk[0] + chunk.get(1).unwrap_or(&0.0)) / 2.0)
+            .collect()
+    } else {
+        samples
+    };
+    
+    // Simple resampling to 48kHz if needed (linear interpolation)
+    let final_samples = if sample_rate != 48000 {
+        println!("Resampling from {} Hz to 48000 Hz", sample_rate);
+        let ratio = 48000.0 / sample_rate as f32;
+        let new_len = (mono_samples.len() as f32 * ratio) as usize;
+        let mut resampled = Vec::with_capacity(new_len);
+        
+        for i in 0..new_len {
+            let src_index = i as f32 / ratio;
+            let index = src_index as usize;
+            if index < mono_samples.len() - 1 {
+                let frac = src_index - index as f32;
+                let sample = mono_samples[index] * (1.0 - frac) + mono_samples[index + 1] * frac;
+                resampled.push(sample);
+            } else if index < mono_samples.len() {
+                resampled.push(mono_samples[index]);
+            }
+        }
+        resampled
+    } else {
+        mono_samples
+    };
+    
+    println!("Processed audio: {} mono samples at 48kHz", final_samples.len());
+    Ok(final_samples)
 }
 
 
