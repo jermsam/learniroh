@@ -8,12 +8,17 @@ use iroh_base::ticket::NodeTicket;
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use ringbuf::traits::{Consumer, Producer, Split};
 use std::future::Future;
+use std::path::Path;
 use tokio::task::JoinHandle;
 
 #[derive(Subcommand)]
 enum Cmd {
     Caller,
-    Receiver { token: String },
+    Receiver { 
+        token: String, 
+        #[arg(default_value = "lost_woods")]
+        ringtone: String 
+    },
 }
 
 #[derive(Parser)]
@@ -52,7 +57,7 @@ async fn call() -> Result<()> {
     Ok(())
 }
 
-async fn receive(ticket: String) -> Result<()> {
+async fn receive(ticket: String, ringtone: String) -> Result<()> {
     let node_id: NodeTicket = ticket
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid node Ticket format"))?;
@@ -64,85 +69,86 @@ async fn receive(ticket: String) -> Result<()> {
     println!("Connected. Opening bi-directional stream...");
     let (send, _recv) = conn.open_bi().await?;
     // Stream ringtone to peer
-    stream_ringtone(send).await?;
+    stream_ringtone(send, ringtone).await?;
     Ok(())
 }
 
-async fn stream_ringtone(mut send: SendStream) -> Result<()> {
-    let sample_rate = 48_000.0f32;
-    let two_pi = core::f32::consts::TAU; // 2π
+async fn stream_ringtone(mut send: SendStream, ringtone: String) -> Result<()> {
+    println!("Loading ringtone '{}'...", ringtone);
     
-    // Ringtone melody: C5, E5, G5, C6 (523, 659, 784, 1047 Hz)
-    let melody_freqs = [523.25, 659.25, 783.99, 1046.50];
-    let note_duration_samples = (sample_rate * 0.5) as usize; // 500ms per note (longer)
-    let pause_duration_samples = (sample_rate * 0.15) as usize; // 150ms pause
-    let fade_samples = (sample_rate * 0.02) as usize; // 20ms fade in/out
-    let chunk_len: usize = 480; // 10ms chunks
-    let mut buf = vec![0u8; chunk_len * 4];
+    // Load audio with fallback logic
+    let audio_samples = load_ringtone_with_fallback(&ringtone)?;
     
-    let mut phase: f32 = 0.0;
-    let mut chunk_counter = 0;
-
-    println!("Streaming high-quality ringtone to peer (48kHz)...");
+    const CHUNK_LEN: usize = 480; // 10ms chunks at 48kHz
+    let mut buf = vec![0u8; CHUNK_LEN * 4];
+    let mut sample_index = 0;
+    let samples_len = audio_samples.len();
+    
+    println!("Streaming ringtone to peer (48kHz)...");
     loop {
-        // Process entire chunk at once for better timing
-        let chunk_start_sample = chunk_counter * chunk_len;
+        // Pre-calculate modulo outside the loop for better performance
+        let start_idx = sample_index % samples_len;
         
-        for i in 0..chunk_len {
-            let current_sample = chunk_start_sample + i;
-            let samples_in_current_segment = current_sample % (note_duration_samples + pause_duration_samples);
-            
-            // Determine if we're in a note or pause
-            let is_note_active = samples_in_current_segment < note_duration_samples;
-            
-            // Update current note based on total progress
-            let current_note = (current_sample / (note_duration_samples + pause_duration_samples)) % melody_freqs.len();
-            
-            let s = if is_note_active {
-                let freq = melody_freqs[current_note];
-                
-                // Calculate envelope for smooth transitions
-                let envelope = if samples_in_current_segment < fade_samples {
-                    // Fade in
-                    samples_in_current_segment as f32 / fade_samples as f32
-                } else if samples_in_current_segment > note_duration_samples - fade_samples {
-                    // Fade out
-                    (note_duration_samples - samples_in_current_segment) as f32 / fade_samples as f32
-                } else {
-                    // Full volume
-                    1.0
-                };
-                
-                // Generate sample with smooth phase continuation
-                let sample = phase.sin() * 0.12 * envelope; // Slightly quieter with envelope
-                phase += two_pi * freq / sample_rate;
-                if phase >= two_pi { phase -= two_pi; }
-                sample
-            } else {
-                // Pause - continue phase evolution to avoid clicks when resuming
-                if current_sample % (note_duration_samples + pause_duration_samples) == note_duration_samples {
-                    // Just entered pause, continue with next note's frequency for smooth transition
-                    let next_note = (current_note + 1) % melody_freqs.len();
-                    let freq = melody_freqs[next_note];
-                    phase += two_pi * freq / sample_rate;
-                    if phase >= two_pi { phase -= two_pi; }
-                }
-                0.0 // Silence during pause
-            };
-            
-            buf[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
+        for i in 0..CHUNK_LEN {
+            let sample = audio_samples[(start_idx + i) % samples_len];
+            buf[i * 4..i * 4 + 4].copy_from_slice(&sample.to_le_bytes());
         }
         
         send.write_all(&buf).await?;
-        chunk_counter += 1;
+        sample_index = (sample_index + CHUNK_LEN) % samples_len;
     }
 }
+
+fn load_ringtone_with_fallback(ringtone: &str) -> Result<Vec<f32>> {
+    let ringtone_path = format!("ringtons/{}.mp3", ringtone);
+    
+    // Try requested ringtone first
+    if Path::new(&ringtone_path).exists() {
+        match load_audio_file(&ringtone_path) {
+            Ok(samples) => {
+                println!("Successfully loaded ringtone '{}': {} samples", ringtone, samples.len());
+                return Ok(samples);
+            }
+            Err(e) => {
+                println!("Failed to load {}: {}", ringtone_path, e);
+            }
+        }
+    } else {
+        println!("Ringtone '{}' not found", ringtone);
+    }
+    
+    // Fallback to lost_woods.mp3
+    println!("Using default lost_woods.mp3");
+    load_audio_file("ringtons/lost_woods.mp3")
+        .map_err(|e| anyhow::anyhow!("Failed to load fallback lost_woods.mp3: {}", e))
+}
+
+fn load_audio_file(path: &str) -> Result<Vec<f32>> {
+    use rodio::Source;
+    use std::fs::File;
+    use std::io::BufReader;
+    
+    // Open the file
+    let file = File::open(path)?;
+    let source = rodio::Decoder::new(BufReader::new(file))?;
+    
+    // Collect all samples and convert to f32
+    let samples: Vec<f32> = source.convert_samples().collect();
+    
+    if samples.is_empty() {
+        return Err(anyhow::anyhow!("No audio data found in file"));
+    }
+    
+    println!("Loaded audio file: {} samples", samples.len());
+    Ok(samples)
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Caller => call().await?,
-        Cmd::Receiver { token } =>receive(token).await?,
+        Cmd::Receiver { token, ringtone } => receive(token, ringtone).await?,
     }
     Ok(())
 }
