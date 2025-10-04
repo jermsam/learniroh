@@ -75,7 +75,7 @@ async fn handle_incoming_call(conn: Connection) -> Result<()> {
     println!("📞 Incoming call detected!");
     
     // Accept the bidirectional stream
-    let (mut _send, mut recv) = conn.accept_bi().await?;
+    let (send, mut recv) = conn.accept_bi().await?;
     
     // Read the incoming call signal
     let mut buffer = [0u8; 13]; // "INCOMING_CALL" length
@@ -88,16 +88,16 @@ async fn handle_incoming_call(conn: Connection) -> Result<()> {
         let default_ringtone = "lost_woods".to_string();
         let ringtone_name = CALLER_RINGTONE.get().unwrap_or(&default_ringtone);
         
-        // Play the caller's ringtone and listen for hangup signal
-        play_caller_ringtone_with_hangup_signal(ringtone_name, recv).await?;
+        // Play the caller's ringtone and listen for hangup signal with acknowledgment
+        play_caller_ringtone_with_hangup_ack(ringtone_name, recv, send).await?;
     }
     
     Ok(())
 }
 
 
-// Function that listens for explicit HANGUP message from peer and local hangup signals
-async fn play_caller_ringtone_with_hangup_signal(ringtone_name: &str, mut recv: iroh::endpoint::RecvStream) -> Result<()> {
+// Function that listens for HANGUP message and sends acknowledgment
+async fn play_caller_ringtone_with_hangup_ack(ringtone_name: &str, mut recv: iroh::endpoint::RecvStream, mut send: iroh::endpoint::SendStream) -> Result<()> {
     println!("🎵 Playing caller's ringtone: {}", ringtone_name);
     
     // Initialize hangup system for caller side
@@ -182,6 +182,15 @@ async fn play_caller_ringtone_with_hangup_signal(ringtone_name: &str, mut recv: 
             if hangup_received {
                 println!("🔇 Peer hung up - stopping ringtone!");
                 stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
+                
+                // Send acknowledgment to peer
+                println!("📤 Sending hangup acknowledgment to peer...");
+                if let Err(e) = send.write_all(b"HANGUP_ACK").await {
+                    println!("⚠️ Failed to send hangup acknowledgment: {}", e);
+                } else {
+                    println!("✅ Hangup acknowledgment sent");
+                }
+                
                 hangup().await?; // Trigger local hangup too
             }
         }
@@ -234,7 +243,7 @@ async fn peer_mode(ticket: String) -> Result<()> {
     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
     let conn = endpoint.connect(node_addr, ALPN).await?;
     println!("Connected. Opening bi-directional stream...");
-    let (mut send, _recv) = conn.open_bi().await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
     
     // Send incoming call signal to trigger caller's ringtone
     println!("📞 Sending incoming call signal...");
@@ -249,7 +258,21 @@ async fn peer_mode(ticket: String) -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             println!("📞 Ctrl+C detected - initiating hangup...");
             hangup().await?;
+            
+            // Send hangup and wait for acknowledgment
             send_hangup_to_caller(&mut send).await?;
+            println!("⏳ Waiting for caller to acknowledge hangup...");
+            
+            // Wait for HANGUP_ACK from caller
+            let mut ack_buf = [0u8; 10]; // "HANGUP_ACK" length
+            match recv.read_exact(&mut ack_buf).await {
+                Ok(_) if &ack_buf == b"HANGUP_ACK" => {
+                    println!("✅ Caller acknowledged hangup - terminating cleanly");
+                }
+                _ => {
+                    println!("⚠️ No acknowledgment received - terminating anyway");
+                }
+            }
         }
         _ = hangup_rx.recv() => {
             println!("📞 Hangup signal received - terminating call...");
