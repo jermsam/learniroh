@@ -50,9 +50,12 @@ static HANGUP_SIGNAL: std::sync::OnceLock<tokio::sync::broadcast::Sender<()>> = 
 
 // Initialize the hangup signal system
 fn init_hangup_system() -> tokio::sync::broadcast::Receiver<()> {
-    let (tx, rx) = tokio::sync::broadcast::channel(1);
-    HANGUP_SIGNAL.set(tx).expect("Failed to initialize hangup system");
-    rx
+    let (sender, receiver) = tokio::sync::broadcast::channel(1);
+    
+    // Store the sender globally so hangup() can access it (only if not already set)
+    let _ = HANGUP_SIGNAL.set(sender); // Ignore error if already set
+    
+    receiver
 }
 
 // Hangup function that can be called by either side
