@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 // use cpal::traits::{DeviceTrait, HostTrait};
-use iroh::endpoint::{Connection, SendStream};
+use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, NodeAddr};
 use iroh_base::ticket::NodeTicket;
@@ -13,11 +13,12 @@ use std::path::Path;
 
 #[derive(Subcommand)]
 enum Cmd {
-    Caller,
-    Receiver { 
-        token: String, 
+    Caller { 
         #[arg(default_value = "lost_woods")]
         ringtone: String 
+    },
+    Peer { 
+        token: String,
     },
 }
 
@@ -35,13 +36,174 @@ struct RadyoProtocol;
 impl ProtocolHandler for RadyoProtocol {
     fn accept(&self, conn: Connection) -> impl Future<Output = Result<(), AcceptError>> + Send {
         async move {
-            audio_stream(conn);
+            incoming_call_handler(conn).await;
             Ok(())
         }
     }
 }
 
-async fn call() -> Result<()> {
+// Global storage for caller's ringtone preference
+static CALLER_RINGTONE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+// Global hangup signal - can be triggered by either side
+static HANGUP_SIGNAL: std::sync::OnceLock<tokio::sync::broadcast::Sender<()>> = std::sync::OnceLock::new();
+
+// Initialize the hangup signal system
+fn init_hangup_system() -> tokio::sync::broadcast::Receiver<()> {
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    HANGUP_SIGNAL.set(tx).expect("Failed to initialize hangup system");
+    rx
+}
+
+// Hangup function that can be called by either side
+async fn hangup() -> Result<()> {
+    if let Some(sender) = HANGUP_SIGNAL.get() {
+        println!("📞 Initiating hangup...");
+        let _ = sender.send(()); // Notify all listeners
+        println!("✅ Hangup signal sent");
+    }
+    Ok(())
+}
+
+async fn incoming_call_handler(conn: Connection) {
+    if let Err(e) = handle_incoming_call(conn).await {
+        eprintln!("❌ Call handling error: {}", e);
+    }
+}
+
+async fn handle_incoming_call(conn: Connection) -> Result<()> {
+    println!("📞 Incoming call detected!");
+    
+    // Accept the bidirectional stream
+    let (mut _send, mut recv) = conn.accept_bi().await?;
+    
+    // Read the incoming call signal
+    let mut buffer = [0u8; 13]; // "INCOMING_CALL" length
+    recv.read_exact(&mut buffer).await?;
+    
+    if &buffer == b"INCOMING_CALL" {
+        println!("📞 Confirmed incoming call - playing ringtone");
+        
+        // Get the caller's preferred ringtone
+        let default_ringtone = "lost_woods".to_string();
+        let ringtone_name = CALLER_RINGTONE.get().unwrap_or(&default_ringtone);
+        
+        // Play the caller's ringtone and listen for hangup signal
+        play_caller_ringtone_with_hangup_signal(ringtone_name, recv).await?;
+    }
+    
+    Ok(())
+}
+
+
+// Function that listens for explicit HANGUP message from peer and local hangup signals
+async fn play_caller_ringtone_with_hangup_signal(ringtone_name: &str, mut recv: iroh::endpoint::RecvStream) -> Result<()> {
+    println!("🎵 Playing caller's ringtone: {}", ringtone_name);
+    
+    // Initialize hangup system for caller side
+    let mut local_hangup_rx = init_hangup_system();
+    
+    // Load the ringtone file
+    let file_path = format!("ringtons/{}.mp3", ringtone_name);
+    let file_data = if Path::new(&file_path).exists() {
+        std::fs::read(&file_path)?
+    } else {
+        println!("Ringtone '{}' not found, using lost_woods.mp3", ringtone_name);
+        std::fs::read("ringtons/lost_woods.mp3")?
+    };
+    
+    println!("🔊 Ringtone playing on caller's device...");
+    println!("💡 Press Ctrl+C or call hangup() to stop");
+    
+    // Create a shared atomic flag to control audio playback
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag_clone = stop_flag.clone();
+    
+    // Spawn the audio task with stop control
+    let file_data_clone = file_data.clone();
+    let audio_task = tokio::task::spawn_blocking(move || -> Result<()> {
+        let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
+        let sink = rodio::Sink::try_new(&stream_handle)?;
+        
+        let cursor = std::io::Cursor::new(file_data_clone);
+        let source = rodio::Decoder::new(cursor)?;
+        
+        sink.append(source);
+        sink.set_volume(0.5);
+        
+        // Check for stop signal periodically while playing
+        loop {
+            if sink.empty() {
+                println!("📞 Ringtone finished naturally");
+                break;
+            }
+            
+            // Check if we should stop
+            if stop_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                println!("📞 Ringtone stopped by hangup signal");
+                sink.stop();
+                break;
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(())
+    });
+    
+    // Listen for hangup signal from peer
+    let peer_hangup_monitor = async move {
+        let mut hangup_buf = [0u8; 6]; // "HANGUP" length
+        match recv.read_exact(&mut hangup_buf).await {
+            Ok(_) if &hangup_buf == b"HANGUP" => {
+                println!("📞 Received HANGUP signal from peer!");
+                true
+            }
+            Ok(_) => {
+                println!("📞 Received unexpected data from peer");
+                false
+            }
+            Err(_) => {
+                println!("📞 Connection lost");
+                false
+            }
+        }
+    };
+    
+    // Race between audio completion, peer hangup, local hangup, and Ctrl+C
+    tokio::select! {
+        result = audio_task => {
+            match result {
+                Ok(Ok(())) => println!("🎵 Ringtone completed normally"),
+                Ok(Err(e)) => println!("❌ Ringtone error: {}", e),
+                Err(e) => println!("❌ Task error: {}", e),
+            }
+        }
+        hangup_received = peer_hangup_monitor => {
+            if hangup_received {
+                println!("🔇 Peer hung up - stopping ringtone!");
+                stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
+                hangup().await?; // Trigger local hangup too
+            }
+        }
+        _ = local_hangup_rx.recv() => {
+            println!("🔇 Local hangup signal received - stopping ringtone!");
+            stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("🔇 Ctrl+C pressed - hanging up call!");
+            stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); // Stop the audio immediately
+            hangup().await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn caller_mode(ringtone: String) -> Result<()> {
+    println!("📞 Starting caller mode with ringtone: {}", ringtone);
+    
+    // Store the ringtone preference globally
+    CALLER_RINGTONE.set(ringtone.clone()).map_err(|_| anyhow::anyhow!("Failed to set ringtone"))?;
     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
     let router = Router::builder(endpoint)
         .accept(ALPN, RadyoProtocol)
@@ -57,7 +219,12 @@ async fn call() -> Result<()> {
     Ok(())
 }
 
-async fn receive(ticket: String, ringtone: String) -> Result<()> {
+async fn peer_mode(ticket: String) -> Result<()> {
+    println!("📞 Starting peer mode - calling: {}", ticket);
+    
+    // Initialize hangup system
+    let mut hangup_rx = init_hangup_system();
+    
     let node_id: NodeTicket = ticket
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid node Ticket format"))?;
@@ -67,238 +234,53 @@ async fn receive(ticket: String, ringtone: String) -> Result<()> {
     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
     let conn = endpoint.connect(node_addr, ALPN).await?;
     println!("Connected. Opening bi-directional stream...");
-    let (send, _recv) = conn.open_bi().await?;
-    // Stream ringtone to peer
-    stream_ringtone(send, ringtone).await?;
+    let (mut send, _recv) = conn.open_bi().await?;
+    
+    // Send incoming call signal to trigger caller's ringtone
+    println!("📞 Sending incoming call signal...");
+    send.write_all(b"INCOMING_CALL").await?;
+    println!("✅ Call initiated - caller should be ringing now");
+    
+    // Set up hangup monitoring
+    println!("⏳ Press Ctrl+C to hang up the call...");
+    println!("💡 You can also call hangup() programmatically");
+    
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("📞 Ctrl+C detected - initiating hangup...");
+            hangup().await?;
+            send_hangup_to_caller(&mut send).await?;
+        }
+        _ = hangup_rx.recv() => {
+            println!("📞 Hangup signal received - terminating call...");
+            send_hangup_to_caller(&mut send).await?;
+        }
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+            println!("📞 Call timed out");
+        }
+    }
+    
     Ok(())
 }
 
-async fn stream_ringtone(mut send: SendStream, ringtone: String) -> Result<()> {
-    println!("Sending ringtone '{}' to caller for playback...", ringtone);
-    
-    // Load the ringtone file to send to the caller
-    let file_path = format!("ringtons/{}.mp3", ringtone);
-    let file_data = if Path::new(&file_path).exists() {
-        std::fs::read(&file_path)?
-    } else {
-        println!("Ringtone '{}' not found, using lost_woods.mp3", ringtone);
-        std::fs::read("ringtons/lost_woods.mp3")?
-    };
-    
-    println!("Sending {} bytes of MP3 data to caller...", file_data.len());
-    
-    // Send file size first (4 bytes)
-    send.write_all(&(file_data.len() as u32).to_le_bytes()).await?;
-    
-    // Send the MP3 file data in chunks
-    const CHUNK_SIZE: usize = 8192; // 8KB chunks
-    for chunk in file_data.chunks(CHUNK_SIZE) {
-        send.write_all(chunk).await?;
+async fn send_hangup_to_caller(send: &mut iroh::endpoint::SendStream) -> Result<()> {
+    println!("📞 Sending hangup signal to caller...");
+    if let Err(e) = send.write_all(b"HANGUP").await {
+        println!("❌ Failed to send hangup signal: {}", e);
+        return Err(e.into());
     }
-    
-    println!("MP3 file sent to caller successfully");
-    println!("Caller should now be playing the ringtone...");
-    
-    // Keep connection alive and wait for Ctrl+C
-    println!("Press Ctrl+C to hang up and stop the ringtone");
-    tokio::signal::ctrl_c().await?;
-    println!("Hanging up - closing connection to stop caller's ringtone");
-    
-    // Close the connection cleanly - this will trigger caller's conn.closed().await
-    drop(send);
-    
+    println!("✅ Hangup signal sent successfully");
     Ok(())
 }
+
 
 
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Cmd::Caller => call().await?,
-        Cmd::Receiver { token, ringtone } => receive(token, ringtone).await?,
+        Cmd::Caller { ringtone } => caller_mode(ringtone).await?,
+        Cmd::Peer { token } => peer_mode(token).await?,
     }
     Ok(())
 }
-/**
-Stream differences:
- - [async vs realtime] QUIC recv is async; audio output is realtime callback.
- - [pull vs push] Audio pulls; network pushes.
- - [bridge] We need a buffer between them.
-Next steps
- - [Choose buffer]
-   - Simple: std::sync::mpsc (easy but can drop samples).
-   - Better: lock-free SPSC ring buffer (e.g., ringbuf crate) for fewer glitches.
- - [Confirm audio format]
-   - What does the sender produce? Sample type (f32/i16), channels (mono/stereo), sample rate (e.g., 48k).
-   - If it doesn’t match a device format, we’ll add conversion/resampling.
- - [Deps]
-   - To play audio with cpal, you’ll need cpal in radyo/Cargo.toml
-*/
-fn audio_stream(conn: Connection) {
-    // Use spawn_blocking to avoid Send issues with cpal::Stream
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async move {
-            if let Err(err) = process_audio_stream(conn).await {
-                eprintln!("audio_stream error: {err}");
-            }
-        });
-    });
-}
-
-async fn process_audio_stream(conn: Connection) -> Result<()> {
-    // Accept a bi-stream:
-    let (mut _send, mut rcv) = conn.accept_bi().await?;
-    
-    // Read file size first (4 bytes)
-    let mut size_buf = [0u8; 4];
-    rcv.read_exact(&mut size_buf).await?;
-    let file_size = u32::from_le_bytes(size_buf) as usize;
-    
-    println!("📞 Incoming call! Receiving ringtone: {} bytes", file_size);
-    
-    // Read the entire MP3 file
-    let mut mp3_data = vec![0u8; file_size];
-    rcv.read_exact(&mut mp3_data).await?;
-    
-    println!("🎵 Playing incoming call ringtone...");
-    
-    // Play the MP3 using rodio properly on the caller side
-    let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
-    let sink = std::sync::Arc::new(rodio::Sink::try_new(&stream_handle)?);
-    
-    // Create a cursor from the MP3 data and decode it
-    let cursor = std::io::Cursor::new(mp3_data);
-    let source = rodio::Decoder::new(cursor)?;
-    
-    sink.append(source);
-    sink.set_volume(0.5); // 50% volume for incoming call
-    
-    println!("🔊 Ringtone playing on caller's device... (Press Ctrl+C to stop)");
-    
-    // Monitor for connection close from receiver
-    let sink_clone = sink.clone();
-    let connection_monitor = async move {
-        println!("🔍 Monitoring for connection close...");
-        conn.closed().await;
-        println!("📞 Connection closed - stopping ringtone");
-        sink_clone.stop();
-    };
-    
-    let sink_for_playback = sink.clone();
-    let playback_monitor = async move {
-        sink_for_playback.sleep_until_end();
-        println!("📞 Call ringtone finished");
-    };
-    
-    // Race between connection monitoring and playback completion
-    tokio::select! {
-        _ = connection_monitor => {
-            println!("🔇 Ringtone stopped due to connection loss");
-        }
-        _ = playback_monitor => {
-            println!("🎵 Ringtone completed normally");
-        }
-    }
-    
-    Ok(())
-}
-
-// LEGACY AUDIO STREAMING FUNCTIONS - COMMENTED OUT
-// These functions were used for raw audio streaming but are not currently used
-// The current implementation uses MP3 file transfer + rodio for playback
-
-/*
-// create a minimum, lock free ring buffer from an async QUIC stream to a realtime consumer
-
-/// Spawn a task that reads little-endian f32 samples from an AsyncRead and pushes them
-/// into a lock-free SPSC ring buffer. Returns the consumer end and the JoinHandle for the
-/// producer task. The consumer can be used by a realtime audio callback to pop samples.
-fn spawn_f32_recv_ring_from_quic(
-    recv: RecvStream,
-    capacity_samples: usize,
-) -> (HeapCons<f32>, JoinHandle<anyhow::Result<()>>) {
-    let rb = HeapRb::<f32>::new(capacity_samples);
-    let (mut prod, cons): (HeapProd<f32>, HeapCons<f32>) = rb.split();
-
-    let handle = tokio::spawn(async move {
-        let mut recv = recv;
-        let mut buf = [0u8; 4];
-        loop {
-            match recv.read_exact(&mut buf).await {
-                Ok(_) => {
-                    let s = f32::from_le_bytes(buf);
-                    // Drop the newest on overflow
-                    let _ = prod.try_push(s);
-                }
-                Err(e) => {
-                    // For now, treat any error as EOF to gracefully handle stream end
-                    eprintln!("Read error (treating as EOF): {e}");
-                    break;
-                }
-            }
-        }
-        Ok(())
-    });
-
-    (cons, handle)
-}
-
-fn playback_stream(mut cons: HeapCons<f32>) -> Result<cpal::Stream> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("No default output audio device found"))?;
-    let supported = device.default_output_config()?; // SupportedStreamConfig
-    let channels = supported.channels() as usize;
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => {
-            let cfg: cpal::StreamConfig = supported.clone().into();
-            device.build_output_stream(
-                &cfg,
-                move |data: &mut [f32], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = cons.try_pop().unwrap_or(0.0);
-                        for sample in frame.iter_mut() { *sample = s; }
-                    }
-                },
-                move |err| eprintln!("audio error: {err}"),
-                None,
-            )?
-        }
-        cpal::SampleFormat::I16 => {
-            let cfg: cpal::StreamConfig = supported.clone().into();
-            device.build_output_stream(
-                &cfg,
-                move |data: &mut [i16], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = cons.try_pop().unwrap_or(0.0);
-                        let s = (s * i16::MAX as f32) as i16;
-                        for sample in frame.iter_mut() { *sample = s; }
-                    }
-                },
-                move |err| eprintln!("audio error: {err}"),
-                None,
-            )?
-        }
-        cpal::SampleFormat::U16 => {
-            let cfg: cpal::StreamConfig = supported.clone().into();
-            device.build_output_stream(
-                &cfg,
-                move |data: &mut [u16], _| {
-                    for frame in data.chunks_mut(channels) {
-                        let s = cons.try_pop().unwrap_or(0.0);
-                        let s = (((s + 1.0) * 0.5).clamp(0.0, 1.0) * u16::MAX as f32) as u16;
-                        for sample in frame.iter_mut() { *sample = s; }
-                    }
-                },
-                move |err| eprintln!("audio error: {err}"),
-                None,
-            )?
-        }
-        _ => unreachable!(),
-    };
-    Ok(stream)
-}
-*/
