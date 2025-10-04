@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, NodeAddr};
@@ -74,113 +74,42 @@ async fn receive(ticket: String, ringtone: String) -> Result<()> {
 }
 
 async fn stream_ringtone(mut send: SendStream, ringtone: String) -> Result<()> {
-    println!("Loading ringtone '{}'...", ringtone);
+    println!("Sending ringtone '{}' to caller for playback...", ringtone);
     
-    // Load audio with fallback logic
-    let audio_samples = load_ringtone_with_fallback(&ringtone)?;
-    
-    const CHUNK_LEN: usize = 480; // 10ms chunks at 48kHz
-    let mut buf = vec![0u8; CHUNK_LEN * 4];
-    let mut sample_index = 0;
-    let samples_len = audio_samples.len();
-    
-    println!("Streaming ringtone to peer (48kHz)...");
-    loop {
-        // Pre-calculate modulo outside the loop for better performance
-        let start_idx = sample_index % samples_len;
-        
-        for i in 0..CHUNK_LEN {
-            let sample = audio_samples[(start_idx + i) % samples_len];
-            buf[i * 4..i * 4 + 4].copy_from_slice(&sample.to_le_bytes());
-        }
-        
-        send.write_all(&buf).await?;
-        sample_index = (sample_index + CHUNK_LEN) % samples_len;
-    }
-}
-
-fn load_ringtone_with_fallback(ringtone: &str) -> Result<Vec<f32>> {
-    let ringtone_path = format!("ringtons/{}.mp3", ringtone);
-    
-    // Try requested ringtone first
-    if Path::new(&ringtone_path).exists() {
-        match load_audio_file(&ringtone_path) {
-            Ok(samples) => {
-                println!("Successfully loaded ringtone '{}': {} samples", ringtone, samples.len());
-                return Ok(samples);
-            }
-            Err(e) => {
-                println!("Failed to load {}: {}", ringtone_path, e);
-            }
-        }
+    // Load the ringtone file to send to the caller
+    let file_path = format!("ringtons/{}.mp3", ringtone);
+    let file_data = if Path::new(&file_path).exists() {
+        std::fs::read(&file_path)?
     } else {
-        println!("Ringtone '{}' not found", ringtone);
-    }
-    
-    // Fallback to lost_woods.mp3
-    println!("Using default lost_woods.mp3");
-    load_audio_file("ringtons/lost_woods.mp3")
-        .map_err(|e| anyhow::anyhow!("Failed to load fallback lost_woods.mp3: {}", e))
-}
-
-fn load_audio_file(path: &str) -> Result<Vec<f32>> {
-    use rodio::Source;
-    use std::fs::File;
-    use std::io::BufReader;
-    
-    // Open the file
-    let file = File::open(path)?;
-    let source = rodio::Decoder::new(BufReader::new(file))?;
-    
-    // Get source info
-    let channels = source.channels();
-    let sample_rate = source.sample_rate();
-    
-    println!("Loading audio: {} channels, {} Hz", channels, sample_rate);
-    
-    // Convert to f32 samples
-    let samples: Vec<f32> = source.convert_samples().collect();
-    
-    if samples.is_empty() {
-        return Err(anyhow::anyhow!("No audio data found in file"));
-    }
-    
-    // Convert stereo to mono if needed
-    let mono_samples = if channels == 2 {
-        println!("Converting stereo to mono");
-        samples.chunks(2)
-            .map(|chunk| (chunk[0] + chunk.get(1).unwrap_or(&0.0)) / 2.0)
-            .collect()
-    } else {
-        samples
+        println!("Ringtone '{}' not found, using lost_woods.mp3", ringtone);
+        std::fs::read("ringtons/lost_woods.mp3")?
     };
     
-    // Simple resampling to 48kHz if needed (linear interpolation)
-    let final_samples = if sample_rate != 48000 {
-        println!("Resampling from {} Hz to 48000 Hz", sample_rate);
-        let ratio = 48000.0 / sample_rate as f32;
-        let new_len = (mono_samples.len() as f32 * ratio) as usize;
-        let mut resampled = Vec::with_capacity(new_len);
-        
-        for i in 0..new_len {
-            let src_index = i as f32 / ratio;
-            let index = src_index as usize;
-            if index < mono_samples.len() - 1 {
-                let frac = src_index - index as f32;
-                let sample = mono_samples[index] * (1.0 - frac) + mono_samples[index + 1] * frac;
-                resampled.push(sample);
-            } else if index < mono_samples.len() {
-                resampled.push(mono_samples[index]);
-            }
-        }
-        resampled
-    } else {
-        mono_samples
-    };
+    println!("Sending {} bytes of MP3 data to caller...", file_data.len());
     
-    println!("Processed audio: {} mono samples at 48kHz", final_samples.len());
-    Ok(final_samples)
+    // Send file size first (4 bytes)
+    send.write_all(&(file_data.len() as u32).to_le_bytes()).await?;
+    
+    // Send the MP3 file data in chunks
+    const CHUNK_SIZE: usize = 8192; // 8KB chunks
+    for chunk in file_data.chunks(CHUNK_SIZE) {
+        send.write_all(chunk).await?;
+    }
+    
+    println!("MP3 file sent to caller successfully");
+    println!("Caller should now be playing the ringtone...");
+    
+    // Keep connection alive and wait for Ctrl+C
+    println!("Press Ctrl+C to hang up and stop the ringtone");
+    tokio::signal::ctrl_c().await?;
+    println!("Hanging up - sending stop signal to caller");
+    
+    // Send hangup signal
+    send.write_all(b"HANGUP").await?;
+    
+    Ok(())
 }
+
 
 
 #[tokio::main]
@@ -219,22 +148,70 @@ fn audio_stream(conn: Connection) {
 }
 
 async fn process_audio_stream(conn: Connection) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    
     // Accept a bi-stream:
-    let (mut _send, rcv) = conn.accept_bi().await?;
-    // Larger buffer: ~200ms @ 48kHz mono for better network jitter handling
-    let (cons, handle) = spawn_f32_recv_ring_from_quic(rcv, 9600);
+    let (mut _send, mut rcv) = conn.accept_bi().await?;
     
-    // Create and start the audio stream
-    let stream = playback_stream(cons)?;
-    stream.play()?;
+    // Read file size first (4 bytes)
+    let mut size_buf = [0u8; 4];
+    rcv.read_exact(&mut size_buf).await?;
+    let file_size = u32::from_le_bytes(size_buf) as usize;
     
-    // Wait for the producer to finish
-    let result = handle.await?;
+    println!("📞 Incoming call! Receiving ringtone: {} bytes", file_size);
     
-    // Keep the stream alive until we're done
-    std::mem::drop(stream);
+    // Read the entire MP3 file
+    let mut mp3_data = vec![0u8; file_size];
+    rcv.read_exact(&mut mp3_data).await?;
     
-    result
+    println!("🎵 Playing incoming call ringtone...");
+    
+    // Play the MP3 using rodio properly on the caller side
+    let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
+    let sink = std::sync::Arc::new(rodio::Sink::try_new(&stream_handle)?);
+    
+    // Create a cursor from the MP3 data and decode it
+    let cursor = std::io::Cursor::new(mp3_data);
+    let source = rodio::Decoder::new(cursor)?;
+    
+    sink.append(source);
+    sink.set_volume(0.5); // 50% volume for incoming call
+    
+    println!("🔊 Ringtone playing on caller's device... (Press Ctrl+C to stop)");
+    
+    // Monitor for hangup signal from receiver
+    let sink_clone = sink.clone();
+    let connection_monitor = async move {
+        let mut hangup_buf = [0u8; 6];
+        match rcv.read_exact(&mut hangup_buf).await {
+            Ok(_) if &hangup_buf == b"HANGUP" => {
+                println!("📞 Received hangup signal - stopping ringtone");
+                sink_clone.stop();
+            }
+            _ => {
+                println!("📞 Connection lost - stopping ringtone");
+                sink_clone.stop();
+            }
+        }
+    };
+    
+    let sink_for_playback = sink.clone();
+    let playback_monitor = async move {
+        sink_for_playback.sleep_until_end();
+        println!("📞 Call ringtone finished");
+    };
+    
+    // Race between connection monitoring and playback completion
+    tokio::select! {
+        _ = connection_monitor => {
+            println!("🔇 Ringtone stopped due to connection loss");
+        }
+        _ = playback_monitor => {
+            println!("🎵 Ringtone completed normally");
+        }
+    }
+    
+    Ok(())
 }
 
 // create a minimum, lock free ring buffer from an async QUIC stream to a realtime consumer
